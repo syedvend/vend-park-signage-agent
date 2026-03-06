@@ -8,6 +8,8 @@
   "dependencies": {
     "@anthropic-ai/sdk": "^0.20.0",
     "@notionhq/client": "^2.2.15",
-    "@slack/bolt": "^3.17.0"
+    "@slack/bolt": "^3.17.0",
+    "googleapis": "^140.0.0",
+    "node-fetch": "^2.7.0"
   }
 }

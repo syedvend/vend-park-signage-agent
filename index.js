@@ -3,6 +3,7 @@ const Anthropic = require("@anthropic-ai/sdk");
 const { Client } = require("@notionhq/client");
 const { google } = require("googleapis");
 const fetch = require("node-fetch");
+const { Readable } = require("stream");
 
 const slack = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -16,7 +17,6 @@ const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID;
 const ROOT_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
-// Set up Google Drive auth from service account JSON
 const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
 const driveAuth = new google.auth.GoogleAuth({
   credentials: serviceAccount,
@@ -30,51 +30,50 @@ const notionPageCache = {};
 
 const SYSTEM_PROMPT = `You are a signage project intake agent for Vend Park, a parking operations company. You work inside a Slack channel called #signage-projects.
 
-Your job is to collect all the information needed to create a signage project. You do this in a conversational, professional but friendly tone — like a smart assistant, not a form.
+Your job has two modes:
 
-The operator (Syed) will paste whatever info he has. Your job is to:
-1. Parse what he's given you
-2. Identify what's missing
-3. Ask only for what's missing, grouped logically (don't ask one question at a time if you can ask 2-3 related ones together)
-4. Once you have everything, output a clean PROJECT SUMMARY in a structured format
+MODE 1 — PROJECT INTAKE
+When the user wants to create or update a signage project, collect all required information conversationally.
 
 REQUIRED fields for a complete project:
 - Property name
-- Property address (for vendor routing and delivery)
-- Sign types needed (one or more of: Rate Board, Park & Pay, Terms & Conditions)
-- For Rate Board: all rate tiers (e.g. 0-1hr: $5, 1-2hr: $8, daily max: $25, monthly: $150)
-- For Park & Pay: the payment URL or QR code destination URL
-- For Terms & Conditions: whether to use standard T&C text or custom
-- Logo: confirm if provided or still needed
-- Font style / brand guidelines (if any)
+- Property address
+- Sign types needed (Rate Board, Park & Pay, Terms & Conditions)
+- For Rate Board: all rate tiers
+- For Park & Pay: payment URL or QR code destination
+- For Terms & Conditions: standard or custom
+- Logo: provided or still needed
+- Font style / brand guidelines
 - Preferred deadline
-- Any special instructions (e.g. weatherproof material, specific dimensions)
-
-OPTIONAL but useful:
-- Property manager name and contact
-- Preferred vendor (if known)
+- Special instructions
 
 Rules:
-- Never ask for a field that has already been provided
+- Never ask for a field already provided
 - Group related follow-up questions together
-- When new information is provided that fills in previously missing fields, output a PARTIAL UPDATE block to capture it
-- After ALL fields are collected, output the full PROJECT SUMMARY block
+- Output PARTIAL UPDATE blocks as info comes in
+- Output full PROJECT SUMMARY only when ALL fields are complete
 
-Use this format for partial updates (when some but not all info is collected):
+Use this format for partial updates:
 ---PARTIAL UPDATE---
-[only include fields that were just provided or updated]
 Property: [if known]
-Rates: [if just provided]
-Park & Pay URL: [if just provided]
-[etc - only fields with new info]
+Address: [if known]
+Sign Types: [if known]
+Rates: [if provided]
+Park & Pay URL: [if provided]
+T&C Type: [if provided]
+Logo: [if provided]
+Brand Guidelines: [if provided]
+Deadline: [if provided]
+Special Instructions: [if provided]
+Vendor: [if provided]
 ---END PARTIAL---
 
-Use this format only when ALL fields are complete:
+Use this format when ALL fields are complete:
 ---PROJECT SUMMARY---
 Property: [name]
 Address: [address]
 Sign Types: [list]
-Rates: [structured rate table or N/A]
+Rates: [rate table or N/A]
 Park & Pay URL: [url or N/A]
 T&C Type: [Standard / Custom]
 Logo: [Provided / Pending]
@@ -83,23 +82,33 @@ Deadline: [date or ASAP]
 Special Instructions: [or None]
 Vendor: [if known or TBD]
 Status: READY FOR NOTION ✅
----END SUMMARY---`;
+---END SUMMARY---
+
+MODE 2 — FILE RETRIEVAL
+When the user asks to see, share, or retrieve files for a property, output a FILE REQUEST block:
+
+---FILE REQUEST---
+Property: [exact property name they mentioned]
+---END FILE REQUEST---
+
+Examples that trigger MODE 2:
+- "Share the signage for Treat Towers"
+- "What files do we have for Santana Row?"
+- "Send me the Bakery Square designs"
+- "Can you pull up the files for [property]?"
+
+Always output the FILE REQUEST block for these — do not ask follow-up questions.`;
 
 // ─── Google Drive helpers ─────────────────────────────────────────────────────
 
-// Find or create a subfolder under the root Signage Projects folder
 async function getOrCreatePropertyFolder(propertyName) {
   const safeName = propertyName.replace(/[^a-zA-Z0-9 ]/g, "").trim();
-
-  // Check if folder already exists
   const res = await drive.files.list({
     q: `'${ROOT_DRIVE_FOLDER_ID}' in parents and name = '${safeName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
     fields: "files(id, name, webViewLink)",
   });
-
   if (res.data.files.length > 0) return res.data.files[0];
 
-  // Create new folder
   const folder = await drive.files.create({
     requestBody: {
       name: safeName,
@@ -108,36 +117,43 @@ async function getOrCreatePropertyFolder(propertyName) {
     },
     fields: "id, name, webViewLink",
   });
-
   return folder.data;
 }
 
-// Download file from Slack and upload to Google Drive
 async function uploadFileToDrive(fileUrl, fileName, mimeType, folderId) {
-  // Download from Slack (requires bot token auth)
   const response = await fetch(fileUrl, {
     headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
   });
-
-  if (!response.ok) throw new Error(`Failed to download file from Slack: ${response.statusText}`);
+  if (!response.ok) throw new Error(`Failed to download from Slack: ${response.statusText}`);
   const buffer = await response.buffer();
-
-  const { Readable } = require("stream");
   const stream = Readable.from(buffer);
 
   const uploaded = await drive.files.create({
-    requestBody: {
-      name: fileName,
-      parents: [folderId],
-    },
-    media: {
-      mimeType,
-      body: stream,
-    },
+    requestBody: { name: fileName, parents: [folderId] },
+    media: { mimeType, body: stream },
     fields: "id, name, webViewLink",
   });
-
   return uploaded.data;
+}
+
+// List all files in a property's Drive folder
+async function getFilesForProperty(propertyName) {
+  const safeName = propertyName.replace(/[^a-zA-Z0-9 ]/g, "").trim();
+  const folderRes = await drive.files.list({
+    q: `'${ROOT_DRIVE_FOLDER_ID}' in parents and name = '${safeName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+    fields: "files(id, name, webViewLink)",
+  });
+
+  if (folderRes.data.files.length === 0) return null;
+  const folder = folderRes.data.files[0];
+
+  const filesRes = await drive.files.list({
+    q: `'${folder.id}' in parents and trashed = false`,
+    fields: "files(id, name, webViewLink, mimeType, createdTime)",
+    orderBy: "createdTime desc",
+  });
+
+  return { folder, files: filesRes.data.files };
 }
 
 // ─── Notion helpers ───────────────────────────────────────────────────────────
@@ -145,17 +161,22 @@ async function uploadFileToDrive(fileUrl, fileName, mimeType, folderId) {
 async function findNotionPage(threadTs) {
   const res = await notion.databases.query({
     database_id: NOTION_DATABASE_ID,
-    filter: {
-      property: "Slack Thread ID",
-      rich_text: { equals: threadTs },
-    },
+    filter: { property: "Slack Thread ID", rich_text: { equals: threadTs } },
+  });
+  return res.results[0] || null;
+}
+
+// Find Notion page by property name (for file retrieval)
+async function findNotionPageByProperty(propertyName) {
+  const res = await notion.databases.query({
+    database_id: NOTION_DATABASE_ID,
+    filter: { property: "title", rich_text: { contains: propertyName } },
   });
   return res.results[0] || null;
 }
 
 function buildProperties(data) {
   const props = {};
-
   if (data["Property"])
     props["title"] = { title: [{ text: { content: data["Property"] } }] };
   if (data["Address"])
@@ -183,7 +204,6 @@ function buildProperties(data) {
     props["Special Instructions"] = { rich_text: [{ text: { content: data["Special Instructions"] } }] };
   if (data["Vendor"])
     props["Vendor Name"] = { rich_text: [{ text: { content: data["Vendor"] } }] };
-
   return props;
 }
 
@@ -191,11 +211,7 @@ async function createNotionPage(threadTs, data, isFinal) {
   const props = buildProperties(data);
   props["Slack Thread ID"] = { rich_text: [{ text: { content: threadTs } }] };
   props["Status"] = { select: { name: isFinal ? "Ready for Design" : "Intake" } };
-
-  await notion.pages.create({
-    parent: { database_id: NOTION_DATABASE_ID },
-    properties: props,
-  });
+  await notion.pages.create({ parent: { database_id: NOTION_DATABASE_ID }, properties: props });
 }
 
 async function updateNotionPage(pageId, data, isFinal) {
@@ -207,9 +223,7 @@ async function updateNotionPage(pageId, data, isFinal) {
 async function updateDriveLink(pageId, folderUrl) {
   await notion.pages.update({
     page_id: pageId,
-    properties: {
-      "Drive Folder": { url: folderUrl },
-    },
+    properties: { "Drive Folder": { url: folderUrl } },
   });
 }
 
@@ -220,9 +234,7 @@ async function loadConversation(pageId) {
     if (!codeBlock) return [];
     const raw = codeBlock.code.rich_text.map(r => r.plain_text).join("");
     return JSON.parse(raw);
-  } catch {
-    return [];
-  }
+  } catch { return []; }
 }
 
 async function saveConversation(pageId, history) {
@@ -238,15 +250,11 @@ async function saveConversation(pageId, history) {
     } else {
       await notion.blocks.children.append({
         block_id: pageId,
-        children: [{
-          object: "block", type: "code",
-          code: { rich_text: [{ text: { content: json } }], language: "json" },
-        }],
+        children: [{ object: "block", type: "code",
+          code: { rich_text: [{ text: { content: json } }], language: "json" } }],
       });
     }
-  } catch (err) {
-    console.error("Failed to save conversation:", err);
-  }
+  } catch (err) { console.error("Failed to save conversation:", err); }
 }
 
 // ─── Parser ───────────────────────────────────────────────────────────────────
@@ -262,11 +270,10 @@ function parseBlock(text, startTag, endTag) {
   return data;
 }
 
-// ─── File handler ─────────────────────────────────────────────────────────────
+// ─── File upload handler ──────────────────────────────────────────────────────
 
 async function handleFileUpload({ file, threadTs, say }) {
   try {
-    // Find the Notion page for this thread
     let notionPage = null;
     if (notionPageCache[threadTs]) {
       notionPage = { id: notionPageCache[threadTs] };
@@ -276,36 +283,59 @@ async function handleFileUpload({ file, threadTs, say }) {
     }
 
     if (!notionPage) {
-      await say({ text: "⚠️ I couldn't find a project for this thread. Please start a project first, then re-upload the file.", thread_ts: threadTs });
+      await say({ text: "⚠️ No project found for this thread. Please start a project first, then re-upload the file.", thread_ts: threadTs });
       return;
     }
 
-    // Get property name from Notion for folder naming
     const page = await notion.pages.retrieve({ page_id: notionPage.id });
     const propertyName = page.properties?.title?.title?.[0]?.plain_text || "Unknown Property";
 
-    // Get or create the property subfolder in Drive
     const folder = await getOrCreatePropertyFolder(propertyName);
-
-    // Upload file to Drive
-    const uploaded = await uploadFileToDrive(
-      file.url_private_download,
-      file.name,
-      file.mimetype,
-      folder.id
-    );
-
-    // Update Notion with Drive folder link
+    const uploaded = await uploadFileToDrive(file.url_private_download, file.name, file.mimetype, folder.id);
     await updateDriveLink(notionPage.id, folder.webViewLink);
 
     await say({
-      text: `📎 *${file.name}* uploaded to Google Drive!\n🗂 Folder: ${folder.webViewLink}\n📄 File: ${uploaded.webViewLink}`,
+      text: `📎 *${file.name}* uploaded successfully!\n🗂 Folder: ${folder.webViewLink}\n📄 File: ${uploaded.webViewLink}`,
       thread_ts: threadTs,
     });
-
   } catch (err) {
     console.error("File upload error:", err);
     await say({ text: "⚠️ Failed to upload file to Google Drive. Please try again.", thread_ts: threadTs });
+  }
+}
+
+// ─── File retrieval handler ───────────────────────────────────────────────────
+
+async function handleFileRetrieval({ propertyName, threadTs, say }) {
+  try {
+    const result = await getFilesForProperty(propertyName);
+
+    if (!result) {
+      await say({
+        text: `🔍 No Google Drive folder found for *${propertyName}*. Files may not have been uploaded yet.`,
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    const { folder, files } = result;
+
+    if (files.length === 0) {
+      await say({
+        text: `📁 Found the folder for *${propertyName}* but it's empty: ${folder.webViewLink}`,
+        thread_ts: threadTs,
+      });
+      return;
+    }
+
+    const fileList = files.map(f => `• <${f.webViewLink}|${f.name}>`).join("\n");
+    await say({
+      text: `📁 Here are the files for *${propertyName}*:\n\n${fileList}\n\n🗂 Full folder: ${folder.webViewLink}`,
+      thread_ts: threadTs,
+    });
+  } catch (err) {
+    console.error("File retrieval error:", err);
+    await say({ text: "⚠️ Failed to retrieve files. Please try again.", thread_ts: threadTs });
   }
 }
 
@@ -321,7 +351,7 @@ const handleMessage = async ({ message, event, say }) => {
 
   if (!text && (!msg.files || msg.files.length === 0)) return;
 
-  // If there's text, process it through Claude first so Notion page exists before file upload
+  // Process text through Claude first so Notion page exists before file upload
   if (text) {
     if (!conversations[threadTs]) conversations[threadTs] = [];
 
@@ -348,12 +378,22 @@ const handleMessage = async ({ message, event, say }) => {
       const reply = response.content.find(b => b.type === "text")?.text || "Sorry, something went wrong.";
       history.push({ role: "assistant", content: reply });
 
+      // Handle FILE REQUEST — retrieve files from Drive
+      if (reply.includes("---FILE REQUEST---")) {
+        const data = parseBlock(reply, "---FILE REQUEST---", "---END FILE REQUEST---");
+        if (data?.["Property"]) {
+          await handleFileRetrieval({ propertyName: data["Property"], threadTs, say });
+          return;
+        }
+      }
+
       const cleanReply = reply
         .replace(/---PARTIAL UPDATE---[\s\S]*?---END PARTIAL---/g, "")
         .replace(/---PROJECT SUMMARY---[\s\S]*?---END SUMMARY---/g, "")
+        .replace(/---FILE REQUEST---[\s\S]*?---END FILE REQUEST---/g, "")
         .trim();
 
-      await say({ text: cleanReply, thread_ts: threadTs });
+      if (cleanReply) await say({ text: cleanReply, thread_ts: threadTs });
 
       if (reply.includes("---PARTIAL UPDATE---")) {
         const data = parseBlock(reply, "---PARTIAL UPDATE---", "---END PARTIAL---");
@@ -392,85 +432,11 @@ const handleMessage = async ({ message, event, say }) => {
     }
   }
 
-  // Handle file uploads AFTER text processing so Notion page exists
+  // Handle file uploads AFTER text so Notion page exists
   if (msg.files && msg.files.length > 0) {
     for (const file of msg.files) {
       await handleFileUpload({ file, threadTs, say });
     }
-  }
-
-  return;
-
-  if (!conversations[threadTs]) conversations[threadTs] = [];
-
-  let notionPage = null;
-  if (notionPageCache[threadTs]) {
-    notionPage = { id: notionPageCache[threadTs] };
-  } else {
-    notionPage = await findNotionPage(threadTs);
-    if (notionPage) notionPageCache[threadTs] = notionPage.id;
-  }
-
-  let history = [];
-  if (notionPage) history = await loadConversation(notionPage.id);
-
-  history.push({ role: "user", content: text });
-
-  try {
-    const response = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
-      system: SYSTEM_PROMPT,
-      messages: history,
-    });
-
-    const reply = response.content.find(b => b.type === "text")?.text || "Sorry, something went wrong.";
-    history.push({ role: "assistant", content: reply });
-
-    // Strip structured blocks before sending to Slack
-    const cleanReply = reply
-      .replace(/---PARTIAL UPDATE---[\s\S]*?---END PARTIAL---/g, "")
-      .replace(/---PROJECT SUMMARY---[\s\S]*?---END SUMMARY---/g, "")
-      .trim();
-
-    await say({ text: cleanReply, thread_ts: threadTs });
-
-    // Handle PARTIAL UPDATE
-    if (reply.includes("---PARTIAL UPDATE---")) {
-      const data = parseBlock(reply, "---PARTIAL UPDATE---", "---END PARTIAL---");
-      if (data) {
-        if (!notionPage) {
-          await createNotionPage(threadTs, data, false);
-          notionPage = await findNotionPage(threadTs);
-          if (notionPage) notionPageCache[threadTs] = notionPage.id;
-          await say({ text: "📋 Project started in Notion — I'll keep updating it as you share more info.", thread_ts: threadTs });
-        } else {
-          await updateNotionPage(notionPage.id, data, false);
-          await say({ text: "📝 Notion updated with the new information!", thread_ts: threadTs });
-        }
-      }
-    }
-
-    // Handle full PROJECT SUMMARY
-    if (reply.includes("---PROJECT SUMMARY---")) {
-      const data = parseBlock(reply, "---PROJECT SUMMARY---", "---END SUMMARY---");
-      if (data) {
-        if (!notionPage) {
-          await createNotionPage(threadTs, data, true);
-          notionPage = await findNotionPage(threadTs);
-          if (notionPage) notionPageCache[threadTs] = notionPage.id;
-        } else {
-          await updateNotionPage(notionPage.id, data, true);
-        }
-        await say({ text: "✅ All done! Notion project is complete and marked *Ready for Design*.", thread_ts: threadTs });
-      }
-    }
-
-    if (notionPage) await saveConversation(notionPage.id, history);
-
-  } catch (err) {
-    console.error("Error:", err);
-    await say({ text: "⚠️ Something went wrong. Please try again.", thread_ts: threadTs });
   }
 };
 

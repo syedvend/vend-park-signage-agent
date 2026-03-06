@@ -15,7 +15,8 @@ const slack = new App({
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID;
-const ROOT_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
+const SHARED_DRIVE_ID = process.env.GOOGLE_SHARED_DRIVE_ID;
+const ROOT_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
 
 const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
 const driveAuth = new google.auth.GoogleAuth({

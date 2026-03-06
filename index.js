@@ -202,8 +202,14 @@ const handleMessage = async ({ message, event, say }) => {
   const text = msg.text?.replace(/<@[A-Z0-9]+>/g, "").trim();
   if (!text) return;
 
-  // Check if a Notion page already exists for this thread
-  let notionPage = await findNotionPage(threadTs);
+  // Check cache first, then Notion
+  let notionPage = null;
+  if (notionPageCache[threadTs]) {
+    notionPage = { id: notionPageCache[threadTs] };
+  } else {
+    notionPage = await findNotionPage(threadTs);
+    if (notionPage) notionPageCache[threadTs] = notionPage.id;
+  }
   let history = [];
 
   if (notionPage) {
@@ -239,6 +245,7 @@ const handleMessage = async ({ message, event, say }) => {
         if (!notionPage) {
           await createNotionPage(threadTs, data, false);
           notionPage = await findNotionPage(threadTs);
+          if (notionPage) notionPageCache[threadTs] = notionPage.id;
           await say({ text: "📋 Project started in Notion — I'll keep updating it as you share more info.", thread_ts: threadTs });
         } else {
           await updateNotionPage(notionPage.id, data, false);

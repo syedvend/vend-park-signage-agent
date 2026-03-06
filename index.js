@@ -319,15 +319,87 @@ const handleMessage = async ({ message, event, say }) => {
   const threadTs = msg.thread_ts || msg.ts;
   const text = msg.text?.replace(/<@[A-Z0-9]+>/g, "").trim();
 
-  // Handle file uploads
+  if (!text && (!msg.files || msg.files.length === 0)) return;
+
+  // If there's text, process it through Claude first so Notion page exists before file upload
+  if (text) {
+    if (!conversations[threadTs]) conversations[threadTs] = [];
+
+    let notionPage = null;
+    if (notionPageCache[threadTs]) {
+      notionPage = { id: notionPageCache[threadTs] };
+    } else {
+      notionPage = await findNotionPage(threadTs);
+      if (notionPage) notionPageCache[threadTs] = notionPage.id;
+    }
+
+    let history = [];
+    if (notionPage) history = await loadConversation(notionPage.id);
+    history.push({ role: "user", content: text });
+
+    try {
+      const response = await anthropic.messages.create({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        system: SYSTEM_PROMPT,
+        messages: history,
+      });
+
+      const reply = response.content.find(b => b.type === "text")?.text || "Sorry, something went wrong.";
+      history.push({ role: "assistant", content: reply });
+
+      const cleanReply = reply
+        .replace(/---PARTIAL UPDATE---[\s\S]*?---END PARTIAL---/g, "")
+        .replace(/---PROJECT SUMMARY---[\s\S]*?---END SUMMARY---/g, "")
+        .trim();
+
+      await say({ text: cleanReply, thread_ts: threadTs });
+
+      if (reply.includes("---PARTIAL UPDATE---")) {
+        const data = parseBlock(reply, "---PARTIAL UPDATE---", "---END PARTIAL---");
+        if (data) {
+          if (!notionPage) {
+            await createNotionPage(threadTs, data, false);
+            notionPage = await findNotionPage(threadTs);
+            if (notionPage) notionPageCache[threadTs] = notionPage.id;
+            await say({ text: "📋 Project started in Notion — I'll keep updating it as you share more info.", thread_ts: threadTs });
+          } else {
+            await updateNotionPage(notionPage.id, data, false);
+            await say({ text: "📝 Notion updated with the new information!", thread_ts: threadTs });
+          }
+        }
+      }
+
+      if (reply.includes("---PROJECT SUMMARY---")) {
+        const data = parseBlock(reply, "---PROJECT SUMMARY---", "---END SUMMARY---");
+        if (data) {
+          if (!notionPage) {
+            await createNotionPage(threadTs, data, true);
+            notionPage = await findNotionPage(threadTs);
+            if (notionPage) notionPageCache[threadTs] = notionPage.id;
+          } else {
+            await updateNotionPage(notionPage.id, data, true);
+          }
+          await say({ text: "✅ All done! Notion project is complete and marked *Ready for Design*.", thread_ts: threadTs });
+        }
+      }
+
+      if (notionPage) await saveConversation(notionPage.id, history);
+
+    } catch (err) {
+      console.error("Error:", err);
+      await say({ text: "⚠️ Something went wrong. Please try again.", thread_ts: threadTs });
+    }
+  }
+
+  // Handle file uploads AFTER text processing so Notion page exists
   if (msg.files && msg.files.length > 0) {
     for (const file of msg.files) {
       await handleFileUpload({ file, threadTs, say });
     }
-    if (!text) return; // If message is only a file with no text, stop here
   }
 
-  if (!text) return;
+  return;
 
   if (!conversations[threadTs]) conversations[threadTs] = [];
 

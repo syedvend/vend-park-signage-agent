@@ -61,23 +61,18 @@ Status: READY FOR NOTION ✅
 
 Only output the PROJECT SUMMARY once you have confirmed all required fields.`;
 
-slack.message(async ({ message, say }) => {
-  // Ignore bot messages
-  if (message.subtype === "bot_message" || message.bot_id) return;
+const handleMessage = async ({ message, say }) => {
+  // Ignore bot messages and subtypes (joins, leaves, etc.)
+  if (message.bot_id || message.subtype) return;
 
   const threadTs = message.thread_ts || message.ts;
-  const userId = message.user;
+  const text = message.text?.replace(/<@[A-Z0-9]+>/g, "").trim(); // strip @mentions
 
-  // Initialize conversation history for this thread if new
-  if (!conversations[threadTs]) {
-    conversations[threadTs] = [];
-  }
+  if (!text) return;
 
-  // Add the user's message to history
-  conversations[threadTs].push({
-    role: "user",
-    content: message.text,
-  });
+  if (!conversations[threadTs]) conversations[threadTs] = [];
+
+  conversations[threadTs].push({ role: "user", content: text });
 
   try {
     const response = await anthropic.messages.create({
@@ -89,25 +84,18 @@ slack.message(async ({ message, say }) => {
 
     const reply = response.content.find((b) => b.type === "text")?.text || "Sorry, something went wrong.";
 
-    // Add assistant reply to history
-    conversations[threadTs].push({
-      role: "assistant",
-      content: reply,
-    });
+    conversations[threadTs].push({ role: "assistant", content: reply });
 
-    // Reply in thread to keep things organized
-    await say({
-      text: reply,
-      thread_ts: threadTs,
-    });
+    await say({ text: reply, thread_ts: threadTs });
   } catch (err) {
     console.error("Claude API error:", err);
-    await say({
-      text: "⚠️ Something went wrong. Please try again.",
-      thread_ts: threadTs,
-    });
+    await say({ text: "⚠️ Something went wrong. Please try again.", thread_ts: threadTs });
   }
-});
+};
+
+// Handle both direct messages and @mentions
+slack.message(handleMessage);
+slack.event("app_mention", handleMessage);
 
 (async () => {
   await slack.start();

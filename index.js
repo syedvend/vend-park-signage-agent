@@ -89,9 +89,9 @@ function buildProperties(data) {
   const props = {};
 
   if (data["Property"])
-    props["Property Name"] = { title: [{ text: { content: data["Property"] } }] };
+    props["title"] = { title: [{ text: { content: data["Property"] } }] };
   if (data["Address"])
-    props["Address"] = { rich_text: [{ text: { content: data["Address"] } }] };
+    props["address"] = { rich_text: [{ text: { content: data["Address"] } }] };
   if (data["Sign Types"]) {
     const types = data["Sign Types"].split(",").map(s => ({ name: s.trim() })).filter(s => s.name);
     if (types.length) props["Sign Types"] = { multi_select: types };
@@ -99,13 +99,13 @@ function buildProperties(data) {
   if (data["Rates"])
     props["Rates"] = { rich_text: [{ text: { content: data["Rates"] } }] };
   if (data["Park & Pay URL"] && data["Park & Pay URL"] !== "N/A")
-    props["Park & Pay URL"] = { url: data["Park & Pay URL"] };
+    props["URL"] = { url: data["Park & Pay URL"] };
   if (data["T&C Type"])
     props["T&C Type"] = { select: { name: data["T&C Type"] } };
   if (data["Logo"])
     props["Logo"] = { select: { name: data["Logo"] } };
   if (data["Brand Guidelines"])
-    props["Brand Guidelines"] = { rich_text: [{ text: { content: data["Brand Guidelines"] } }] };
+    props["brand guidelines"] = { rich_text: [{ text: { content: data["Brand Guidelines"] } }] };
   if (data["Deadline"] && data["Deadline"] !== "ASAP") {
     try {
       props["Deadline"] = { date: { start: new Date(data["Deadline"]).toISOString().split("T")[0] } };
@@ -114,7 +114,7 @@ function buildProperties(data) {
   if (data["Special Instructions"])
     props["Special Instructions"] = { rich_text: [{ text: { content: data["Special Instructions"] } }] };
   if (data["Vendor"])
-    props["Vendor"] = { rich_text: [{ text: { content: data["Vendor"] } }] };
+    props["Vendor Name"] = { rich_text: [{ text: { content: data["Vendor"] } }] };
 
   return props;
 }

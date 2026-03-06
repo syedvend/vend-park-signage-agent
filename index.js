@@ -1,6 +1,8 @@
 const { App } = require("@slack/bolt");
 const Anthropic = require("@anthropic-ai/sdk");
 const { Client } = require("@notionhq/client");
+const { google } = require("googleapis");
+const fetch = require("node-fetch");
 
 const slack = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -12,6 +14,19 @@ const slack = new App({
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
 const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID;
+const ROOT_DRIVE_FOLDER_ID = process.env.GOOGLE_DRIVE_FOLDER_ID;
+
+// Set up Google Drive auth from service account JSON
+const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+const driveAuth = new google.auth.GoogleAuth({
+  credentials: serviceAccount,
+  scopes: ["https://www.googleapis.com/auth/drive"],
+});
+const drive = google.drive({ version: "v3", auth: driveAuth });
+
+// In-memory stores
+const conversations = {};
+const notionPageCache = {};
 
 const SYSTEM_PROMPT = `You are a signage project intake agent for Vend Park, a parking operations company. You work inside a Slack channel called #signage-projects.
 
@@ -70,9 +85,63 @@ Vendor: [if known or TBD]
 Status: READY FOR NOTION ✅
 ---END SUMMARY---`;
 
+// ─── Google Drive helpers ─────────────────────────────────────────────────────
+
+// Find or create a subfolder under the root Signage Projects folder
+async function getOrCreatePropertyFolder(propertyName) {
+  const safeName = propertyName.replace(/[^a-zA-Z0-9 ]/g, "").trim();
+
+  // Check if folder already exists
+  const res = await drive.files.list({
+    q: `'${ROOT_DRIVE_FOLDER_ID}' in parents and name = '${safeName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+    fields: "files(id, name, webViewLink)",
+  });
+
+  if (res.data.files.length > 0) return res.data.files[0];
+
+  // Create new folder
+  const folder = await drive.files.create({
+    requestBody: {
+      name: safeName,
+      mimeType: "application/vnd.google-apps.folder",
+      parents: [ROOT_DRIVE_FOLDER_ID],
+    },
+    fields: "id, name, webViewLink",
+  });
+
+  return folder.data;
+}
+
+// Download file from Slack and upload to Google Drive
+async function uploadFileToDrive(fileUrl, fileName, mimeType, folderId) {
+  // Download from Slack (requires bot token auth)
+  const response = await fetch(fileUrl, {
+    headers: { Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}` },
+  });
+
+  if (!response.ok) throw new Error(`Failed to download file from Slack: ${response.statusText}`);
+  const buffer = await response.buffer();
+
+  const { Readable } = require("stream");
+  const stream = Readable.from(buffer);
+
+  const uploaded = await drive.files.create({
+    requestBody: {
+      name: fileName,
+      parents: [folderId],
+    },
+    media: {
+      mimeType,
+      body: stream,
+    },
+    fields: "id, name, webViewLink",
+  });
+
+  return uploaded.data;
+}
+
 // ─── Notion helpers ───────────────────────────────────────────────────────────
 
-// Find an existing Notion page by Slack thread ID
 async function findNotionPage(threadTs) {
   const res = await notion.databases.query({
     database_id: NOTION_DATABASE_ID,
@@ -84,7 +153,6 @@ async function findNotionPage(threadTs) {
   return res.results[0] || null;
 }
 
-// Build Notion properties object from parsed data (only include non-empty fields)
 function buildProperties(data) {
   const props = {};
 
@@ -119,7 +187,6 @@ function buildProperties(data) {
   return props;
 }
 
-// Create a new Notion page for this project
 async function createNotionPage(threadTs, data, isFinal) {
   const props = buildProperties(data);
   props["Slack Thread ID"] = { rich_text: [{ text: { content: threadTs } }] };
@@ -131,15 +198,21 @@ async function createNotionPage(threadTs, data, isFinal) {
   });
 }
 
-// Update an existing Notion page with new fields
 async function updateNotionPage(pageId, data, isFinal) {
   const props = buildProperties(data);
   if (isFinal) props["Status"] = { select: { name: "Ready for Design" } };
-
   await notion.pages.update({ page_id: pageId, properties: props });
 }
 
-// Load conversation history stored in Notion page body
+async function updateDriveLink(pageId, folderUrl) {
+  await notion.pages.update({
+    page_id: pageId,
+    properties: {
+      "Drive Folder": { url: folderUrl },
+    },
+  });
+}
+
 async function loadConversation(pageId) {
   try {
     const blocks = await notion.blocks.children.list({ block_id: pageId });
@@ -152,13 +225,11 @@ async function loadConversation(pageId) {
   }
 }
 
-// Save conversation history into a code block on the Notion page
 async function saveConversation(pageId, history) {
   try {
     const blocks = await notion.blocks.children.list({ block_id: pageId });
     const codeBlock = blocks.results.find(b => b.type === "code");
     const json = JSON.stringify(history);
-
     if (codeBlock) {
       await notion.blocks.update({
         block_id: codeBlock.id,
@@ -191,6 +262,53 @@ function parseBlock(text, startTag, endTag) {
   return data;
 }
 
+// ─── File handler ─────────────────────────────────────────────────────────────
+
+async function handleFileUpload({ file, threadTs, say }) {
+  try {
+    // Find the Notion page for this thread
+    let notionPage = null;
+    if (notionPageCache[threadTs]) {
+      notionPage = { id: notionPageCache[threadTs] };
+    } else {
+      notionPage = await findNotionPage(threadTs);
+      if (notionPage) notionPageCache[threadTs] = notionPage.id;
+    }
+
+    if (!notionPage) {
+      await say({ text: "⚠️ I couldn't find a project for this thread. Please start a project first, then re-upload the file.", thread_ts: threadTs });
+      return;
+    }
+
+    // Get property name from Notion for folder naming
+    const page = await notion.pages.retrieve({ page_id: notionPage.id });
+    const propertyName = page.properties?.title?.title?.[0]?.plain_text || "Unknown Property";
+
+    // Get or create the property subfolder in Drive
+    const folder = await getOrCreatePropertyFolder(propertyName);
+
+    // Upload file to Drive
+    const uploaded = await uploadFileToDrive(
+      file.url_private_download,
+      file.name,
+      file.mimetype,
+      folder.id
+    );
+
+    // Update Notion with Drive folder link
+    await updateDriveLink(notionPage.id, folder.webViewLink);
+
+    await say({
+      text: `📎 *${file.name}* uploaded to Google Drive!\n🗂 Folder: ${folder.webViewLink}\n📄 File: ${uploaded.webViewLink}`,
+      thread_ts: threadTs,
+    });
+
+  } catch (err) {
+    console.error("File upload error:", err);
+    await say({ text: "⚠️ Failed to upload file to Google Drive. Please try again.", thread_ts: threadTs });
+  }
+}
+
 // ─── Main message handler ─────────────────────────────────────────────────────
 
 const handleMessage = async ({ message, event, say }) => {
@@ -200,9 +318,19 @@ const handleMessage = async ({ message, event, say }) => {
 
   const threadTs = msg.thread_ts || msg.ts;
   const text = msg.text?.replace(/<@[A-Z0-9]+>/g, "").trim();
+
+  // Handle file uploads
+  if (msg.files && msg.files.length > 0) {
+    for (const file of msg.files) {
+      await handleFileUpload({ file, threadTs, say });
+    }
+    if (!text) return; // If message is only a file with no text, stop here
+  }
+
   if (!text) return;
 
-  // Check cache first, then Notion
+  if (!conversations[threadTs]) conversations[threadTs] = [];
+
   let notionPage = null;
   if (notionPageCache[threadTs]) {
     notionPage = { id: notionPageCache[threadTs] };
@@ -210,12 +338,9 @@ const handleMessage = async ({ message, event, say }) => {
     notionPage = await findNotionPage(threadTs);
     if (notionPage) notionPageCache[threadTs] = notionPage.id;
   }
-  let history = [];
 
-  if (notionPage) {
-    // Load persisted conversation history from Notion
-    history = await loadConversation(notionPage.id);
-  }
+  let history = [];
+  if (notionPage) history = await loadConversation(notionPage.id);
 
   history.push({ role: "user", content: text });
 
@@ -230,7 +355,7 @@ const handleMessage = async ({ message, event, say }) => {
     const reply = response.content.find(b => b.type === "text")?.text || "Sorry, something went wrong.";
     history.push({ role: "assistant", content: reply });
 
-    // Strip PARTIAL UPDATE blocks before sending to Slack
+    // Strip structured blocks before sending to Slack
     const cleanReply = reply
       .replace(/---PARTIAL UPDATE---[\s\S]*?---END PARTIAL---/g, "")
       .replace(/---PROJECT SUMMARY---[\s\S]*?---END SUMMARY---/g, "")
@@ -238,7 +363,7 @@ const handleMessage = async ({ message, event, say }) => {
 
     await say({ text: cleanReply, thread_ts: threadTs });
 
-    // Handle PARTIAL UPDATE — create or update Notion page with new fields
+    // Handle PARTIAL UPDATE
     if (reply.includes("---PARTIAL UPDATE---")) {
       const data = parseBlock(reply, "---PARTIAL UPDATE---", "---END PARTIAL---");
       if (data) {
@@ -254,21 +379,21 @@ const handleMessage = async ({ message, event, say }) => {
       }
     }
 
-    // Handle full PROJECT SUMMARY — final update, mark as Ready for Design
+    // Handle full PROJECT SUMMARY
     if (reply.includes("---PROJECT SUMMARY---")) {
       const data = parseBlock(reply, "---PROJECT SUMMARY---", "---END SUMMARY---");
       if (data) {
         if (!notionPage) {
           await createNotionPage(threadTs, data, true);
+          notionPage = await findNotionPage(threadTs);
+          if (notionPage) notionPageCache[threadTs] = notionPage.id;
         } else {
           await updateNotionPage(notionPage.id, data, true);
         }
         await say({ text: "✅ All done! Notion project is complete and marked *Ready for Design*.", thread_ts: threadTs });
-        notionPage = await findNotionPage(threadTs);
       }
     }
 
-    // Always persist the latest conversation history to Notion
     if (notionPage) await saveConversation(notionPage.id, history);
 
   } catch (err) {
@@ -277,13 +402,11 @@ const handleMessage = async ({ message, event, say }) => {
   }
 };
 
-// Only use app_mention to avoid double-firing when bot is @mentioned
 slack.message(async (args) => {
   if (args.message?.text?.includes(`<@`)) return;
   await handleMessage(args);
 });
 slack.event("app_mention", async (args) => {
-  // Prevent duplicate handling if already processed as a message
   await handleMessage(args);
 });
 

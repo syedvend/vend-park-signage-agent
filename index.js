@@ -193,11 +193,13 @@ function parseBlock(text, startTag, endTag) {
 
 // ─── Main message handler ─────────────────────────────────────────────────────
 
-const handleMessage = async ({ message, say }) => {
-  if (message.bot_id || message.subtype) return;
+const handleMessage = async ({ message, event, say }) => {
+  const msg = message || event;
+  if (!msg) return;
+  if (msg.bot_id || msg.subtype) return;
 
-  const threadTs = message.thread_ts || message.ts;
-  const text = message.text?.replace(/<@[A-Z0-9]+>/g, "").trim();
+  const threadTs = msg.thread_ts || msg.ts;
+  const text = msg.text?.replace(/<@[A-Z0-9]+>/g, "").trim();
   if (!text) return;
 
   // Check if a Notion page already exists for this thread

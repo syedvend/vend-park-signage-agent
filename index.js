@@ -264,7 +264,12 @@ const handleMessage = async ({ message, event, say }) => {
   }
 };
 
-slack.message(handleMessage);
+// Only use app_mention to avoid double-firing when bot is @mentioned
+slack.message(async (args) => {
+  // Skip if this is an @mention — app_mention will handle it
+  if (args.message?.text?.includes(`<@`)) return;
+  await handleMessage(args);
+});
 slack.event("app_mention", handleMessage);
 
 (async () => {

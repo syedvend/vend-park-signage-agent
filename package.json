@@ -1,1 +1,12 @@
-
+{
+  "name": "vend-park-signage-agent",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.20.0",
+    "@slack/bolt": "^3.17.0"
+  }
+}

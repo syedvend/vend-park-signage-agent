@@ -1,5 +1,6 @@
 const { App } = require("@slack/bolt");
 const Anthropic = require("@anthropic-ai/sdk");
+const { Client } = require("@notionhq/client");
 
 const slack = new App({
   token: process.env.SLACK_BOT_TOKEN,
@@ -9,6 +10,9 @@ const slack = new App({
 });
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const notion = new Client({ auth: process.env.NOTION_TOKEN });
+
+const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID;
 
 // In-memory store for conversation history per Slack thread
 const conversations = {};
@@ -61,12 +65,78 @@ Status: READY FOR NOTION ✅
 
 Only output the PROJECT SUMMARY once you have confirmed all required fields.`;
 
+// Parse the PROJECT SUMMARY block into structured fields
+function parseSummary(text) {
+  const block = text.match(/---PROJECT SUMMARY---([\s\S]*?)---END SUMMARY---/);
+  if (!block) return null;
+
+  const lines = block[1].trim().split("\n");
+  const data = {};
+  for (const line of lines) {
+    const [key, ...rest] = line.split(":");
+    if (key && rest.length) data[key.trim()] = rest.join(":").trim();
+  }
+  return data;
+}
+
+// Create a Notion page from parsed summary data
+async function createNotionProject(data) {
+  const signTypes = (data["Sign Types"] || "")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(name => ({ name }));
+
+  await notion.pages.create({
+    parent: { database_id: NOTION_DATABASE_ID },
+    properties: {
+      "Property Name": {
+        title: [{ text: { content: data["Property"] || "Untitled" } }],
+      },
+      "Address": {
+        rich_text: [{ text: { content: data["Address"] || "" } }],
+      },
+      "Sign Types": {
+        multi_select: signTypes,
+      },
+      "Rates": {
+        rich_text: [{ text: { content: data["Rates"] || "" } }],
+      },
+      "Park & Pay URL": {
+        url: data["Park & Pay URL"] && data["Park & Pay URL"] !== "N/A"
+          ? data["Park & Pay URL"]
+          : null,
+      },
+      "T&C Type": {
+        select: data["T&C Type"] ? { name: data["T&C Type"] } : null,
+      },
+      "Logo": {
+        select: data["Logo"] ? { name: data["Logo"] } : null,
+      },
+      "Brand Guidelines": {
+        rich_text: [{ text: { content: data["Brand Guidelines"] || "" } }],
+      },
+      "Deadline": data["Deadline"] && data["Deadline"] !== "ASAP"
+        ? { date: { start: new Date(data["Deadline"]).toISOString().split("T")[0] } }
+        : undefined,
+      "Special Instructions": {
+        rich_text: [{ text: { content: data["Special Instructions"] || "" } }],
+      },
+      "Vendor": {
+        rich_text: [{ text: { content: data["Vendor"] || "TBD" } }],
+      },
+      "Status": {
+        select: { name: "Intake" },
+      },
+    },
+  });
+}
+
 const handleMessage = async ({ message, say }) => {
-  // Ignore bot messages and subtypes (joins, leaves, etc.)
   if (message.bot_id || message.subtype) return;
 
   const threadTs = message.thread_ts || message.ts;
-  const text = message.text?.replace(/<@[A-Z0-9]+>/g, "").trim(); // strip @mentions
+  const text = message.text?.replace(/<@[A-Z0-9]+>/g, "").trim();
 
   if (!text) return;
 
@@ -87,13 +157,24 @@ const handleMessage = async ({ message, say }) => {
     conversations[threadTs].push({ role: "assistant", content: reply });
 
     await say({ text: reply, thread_ts: threadTs });
+
+    // If the reply contains a PROJECT SUMMARY, create a Notion record
+    if (reply.includes("---PROJECT SUMMARY---")) {
+      const data = parseSummary(reply);
+      if (data) {
+        await createNotionProject(data);
+        await say({
+          text: "✅ Project created in Notion! You can view it in your Signage Projects database.",
+          thread_ts: threadTs,
+        });
+      }
+    }
   } catch (err) {
-    console.error("Claude API error:", err);
+    console.error("Error:", err);
     await say({ text: "⚠️ Something went wrong. Please try again.", thread_ts: threadTs });
   }
 };
 
-// Handle both direct messages and @mentions
 slack.message(handleMessage);
 slack.event("app_mention", handleMessage);
 

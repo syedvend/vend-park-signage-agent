@@ -192,7 +192,7 @@ function buildProperties(data) {
   if (data["T&C Type"])
     props["T&C Type"] = { select: { name: data["T&C Type"] } };
   if (data["Logo"])
-    props["Logo"] = { select: { name: data["Logo"] } };
+    props["Logo Status"] = { select: { name: data["Logo"] } };
   if (data["Brand Guidelines"])
     props["brand guidelines"] = { rich_text: [{ text: { content: data["Brand Guidelines"] } }] };
   if (data["Deadline"] && data["Deadline"] !== "ASAP") {

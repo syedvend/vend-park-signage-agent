@@ -224,7 +224,13 @@ const handleMessage = async ({ message, event, say }) => {
     const reply = response.content.find(b => b.type === "text")?.text || "Sorry, something went wrong.";
     history.push({ role: "assistant", content: reply });
 
-    await say({ text: reply, thread_ts: threadTs });
+    // Strip PARTIAL UPDATE blocks before sending to Slack
+    const cleanReply = reply
+      .replace(/---PARTIAL UPDATE---[\s\S]*?---END PARTIAL---/g, "")
+      .replace(/---PROJECT SUMMARY---[\s\S]*?---END SUMMARY---/g, "")
+      .trim();
+
+    await say({ text: cleanReply, thread_ts: threadTs });
 
     // Handle PARTIAL UPDATE — create or update Notion page with new fields
     if (reply.includes("---PARTIAL UPDATE---")) {
@@ -266,11 +272,13 @@ const handleMessage = async ({ message, event, say }) => {
 
 // Only use app_mention to avoid double-firing when bot is @mentioned
 slack.message(async (args) => {
-  // Skip if this is an @mention — app_mention will handle it
   if (args.message?.text?.includes(`<@`)) return;
   await handleMessage(args);
 });
-slack.event("app_mention", handleMessage);
+slack.event("app_mention", async (args) => {
+  // Prevent duplicate handling if already processed as a message
+  await handleMessage(args);
+});
 
 (async () => {
   await slack.start();

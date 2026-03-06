@@ -11,11 +11,7 @@ const slack = new App({
 
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const notion = new Client({ auth: process.env.NOTION_TOKEN });
-
 const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID;
-
-// In-memory store for conversation history per Slack thread
-const conversations = {};
 
 const SYSTEM_PROMPT = `You are a signage project intake agent for Vend Park, a parking operations company. You work inside a Slack channel called #signage-projects.
 
@@ -46,8 +42,19 @@ OPTIONAL but useful:
 Rules:
 - Never ask for a field that has already been provided
 - Group related follow-up questions together
-- After all fields are collected, output a structured PROJECT SUMMARY block using this exact format:
+- When new information is provided that fills in previously missing fields, output a PARTIAL UPDATE block to capture it
+- After ALL fields are collected, output the full PROJECT SUMMARY block
 
+Use this format for partial updates (when some but not all info is collected):
+---PARTIAL UPDATE---
+[only include fields that were just provided or updated]
+Property: [if known]
+Rates: [if just provided]
+Park & Pay URL: [if just provided]
+[etc - only fields with new info]
+---END PARTIAL---
+
+Use this format only when ALL fields are complete:
 ---PROJECT SUMMARY---
 Property: [name]
 Address: [address]
@@ -61,114 +68,194 @@ Deadline: [date or ASAP]
 Special Instructions: [or None]
 Vendor: [if known or TBD]
 Status: READY FOR NOTION ✅
----END SUMMARY---
+---END SUMMARY---`;
 
-Only output the PROJECT SUMMARY once you have confirmed all required fields.`;
+// ─── Notion helpers ───────────────────────────────────────────────────────────
 
-// Parse the PROJECT SUMMARY block into structured fields
-function parseSummary(text) {
-  const block = text.match(/---PROJECT SUMMARY---([\s\S]*?)---END SUMMARY---/);
-  if (!block) return null;
+// Find an existing Notion page by Slack thread ID
+async function findNotionPage(threadTs) {
+  const res = await notion.databases.query({
+    database_id: NOTION_DATABASE_ID,
+    filter: {
+      property: "Slack Thread ID",
+      rich_text: { equals: threadTs },
+    },
+  });
+  return res.results[0] || null;
+}
 
-  const lines = block[1].trim().split("\n");
+// Build Notion properties object from parsed data (only include non-empty fields)
+function buildProperties(data) {
+  const props = {};
+
+  if (data["Property"])
+    props["Property Name"] = { title: [{ text: { content: data["Property"] } }] };
+  if (data["Address"])
+    props["Address"] = { rich_text: [{ text: { content: data["Address"] } }] };
+  if (data["Sign Types"]) {
+    const types = data["Sign Types"].split(",").map(s => ({ name: s.trim() })).filter(s => s.name);
+    if (types.length) props["Sign Types"] = { multi_select: types };
+  }
+  if (data["Rates"])
+    props["Rates"] = { rich_text: [{ text: { content: data["Rates"] } }] };
+  if (data["Park & Pay URL"] && data["Park & Pay URL"] !== "N/A")
+    props["Park & Pay URL"] = { url: data["Park & Pay URL"] };
+  if (data["T&C Type"])
+    props["T&C Type"] = { select: { name: data["T&C Type"] } };
+  if (data["Logo"])
+    props["Logo"] = { select: { name: data["Logo"] } };
+  if (data["Brand Guidelines"])
+    props["Brand Guidelines"] = { rich_text: [{ text: { content: data["Brand Guidelines"] } }] };
+  if (data["Deadline"] && data["Deadline"] !== "ASAP") {
+    try {
+      props["Deadline"] = { date: { start: new Date(data["Deadline"]).toISOString().split("T")[0] } };
+    } catch {}
+  }
+  if (data["Special Instructions"])
+    props["Special Instructions"] = { rich_text: [{ text: { content: data["Special Instructions"] } }] };
+  if (data["Vendor"])
+    props["Vendor"] = { rich_text: [{ text: { content: data["Vendor"] } }] };
+
+  return props;
+}
+
+// Create a new Notion page for this project
+async function createNotionPage(threadTs, data, isFinal) {
+  const props = buildProperties(data);
+  props["Slack Thread ID"] = { rich_text: [{ text: { content: threadTs } }] };
+  props["Status"] = { select: { name: isFinal ? "Ready for Design" : "Intake" } };
+
+  await notion.pages.create({
+    parent: { database_id: NOTION_DATABASE_ID },
+    properties: props,
+  });
+}
+
+// Update an existing Notion page with new fields
+async function updateNotionPage(pageId, data, isFinal) {
+  const props = buildProperties(data);
+  if (isFinal) props["Status"] = { select: { name: "Ready for Design" } };
+
+  await notion.pages.update({ page_id: pageId, properties: props });
+}
+
+// Load conversation history stored in Notion page body
+async function loadConversation(pageId) {
+  try {
+    const blocks = await notion.blocks.children.list({ block_id: pageId });
+    const codeBlock = blocks.results.find(b => b.type === "code");
+    if (!codeBlock) return [];
+    const raw = codeBlock.code.rich_text.map(r => r.plain_text).join("");
+    return JSON.parse(raw);
+  } catch {
+    return [];
+  }
+}
+
+// Save conversation history into a code block on the Notion page
+async function saveConversation(pageId, history) {
+  try {
+    const blocks = await notion.blocks.children.list({ block_id: pageId });
+    const codeBlock = blocks.results.find(b => b.type === "code");
+    const json = JSON.stringify(history);
+
+    if (codeBlock) {
+      await notion.blocks.update({
+        block_id: codeBlock.id,
+        code: { rich_text: [{ text: { content: json } }], language: "json" },
+      });
+    } else {
+      await notion.blocks.children.append({
+        block_id: pageId,
+        children: [{
+          object: "block", type: "code",
+          code: { rich_text: [{ text: { content: json } }], language: "json" },
+        }],
+      });
+    }
+  } catch (err) {
+    console.error("Failed to save conversation:", err);
+  }
+}
+
+// ─── Parser ───────────────────────────────────────────────────────────────────
+
+function parseBlock(text, startTag, endTag) {
+  const match = text.match(new RegExp(`${startTag}([\\s\\S]*?)${endTag}`));
+  if (!match) return null;
   const data = {};
-  for (const line of lines) {
+  for (const line of match[1].trim().split("\n")) {
     const [key, ...rest] = line.split(":");
     if (key && rest.length) data[key.trim()] = rest.join(":").trim();
   }
   return data;
 }
 
-// Create a Notion page from parsed summary data
-async function createNotionProject(data) {
-  const signTypes = (data["Sign Types"] || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean)
-    .map(name => ({ name }));
-
-  await notion.pages.create({
-    parent: { database_id: NOTION_DATABASE_ID },
-    properties: {
-      "Property Name": {
-        title: [{ text: { content: data["Property"] || "Untitled" } }],
-      },
-      "Address": {
-        rich_text: [{ text: { content: data["Address"] || "" } }],
-      },
-      "Sign Types": {
-        multi_select: signTypes,
-      },
-      "Rates": {
-        rich_text: [{ text: { content: data["Rates"] || "" } }],
-      },
-      "Park & Pay URL": {
-        url: data["Park & Pay URL"] && data["Park & Pay URL"] !== "N/A"
-          ? data["Park & Pay URL"]
-          : null,
-      },
-      "T&C Type": {
-        select: data["T&C Type"] ? { name: data["T&C Type"] } : null,
-      },
-      "Logo": {
-        select: data["Logo"] ? { name: data["Logo"] } : null,
-      },
-      "Brand Guidelines": {
-        rich_text: [{ text: { content: data["Brand Guidelines"] || "" } }],
-      },
-      "Deadline": data["Deadline"] && data["Deadline"] !== "ASAP"
-        ? { date: { start: new Date(data["Deadline"]).toISOString().split("T")[0] } }
-        : undefined,
-      "Special Instructions": {
-        rich_text: [{ text: { content: data["Special Instructions"] || "" } }],
-      },
-      "Vendor": {
-        rich_text: [{ text: { content: data["Vendor"] || "TBD" } }],
-      },
-      "Status": {
-        select: { name: "Intake" },
-      },
-    },
-  });
-}
+// ─── Main message handler ─────────────────────────────────────────────────────
 
 const handleMessage = async ({ message, say }) => {
   if (message.bot_id || message.subtype) return;
 
   const threadTs = message.thread_ts || message.ts;
   const text = message.text?.replace(/<@[A-Z0-9]+>/g, "").trim();
-
   if (!text) return;
 
-  if (!conversations[threadTs]) conversations[threadTs] = [];
+  // Check if a Notion page already exists for this thread
+  let notionPage = await findNotionPage(threadTs);
+  let history = [];
 
-  conversations[threadTs].push({ role: "user", content: text });
+  if (notionPage) {
+    // Load persisted conversation history from Notion
+    history = await loadConversation(notionPage.id);
+  }
+
+  history.push({ role: "user", content: text });
 
   try {
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 1000,
       system: SYSTEM_PROMPT,
-      messages: conversations[threadTs],
+      messages: history,
     });
 
-    const reply = response.content.find((b) => b.type === "text")?.text || "Sorry, something went wrong.";
-
-    conversations[threadTs].push({ role: "assistant", content: reply });
+    const reply = response.content.find(b => b.type === "text")?.text || "Sorry, something went wrong.";
+    history.push({ role: "assistant", content: reply });
 
     await say({ text: reply, thread_ts: threadTs });
 
-    // If the reply contains a PROJECT SUMMARY, create a Notion record
-    if (reply.includes("---PROJECT SUMMARY---")) {
-      const data = parseSummary(reply);
+    // Handle PARTIAL UPDATE — create or update Notion page with new fields
+    if (reply.includes("---PARTIAL UPDATE---")) {
+      const data = parseBlock(reply, "---PARTIAL UPDATE---", "---END PARTIAL---");
       if (data) {
-        await createNotionProject(data);
-        await say({
-          text: "✅ Project created in Notion! You can view it in your Signage Projects database.",
-          thread_ts: threadTs,
-        });
+        if (!notionPage) {
+          await createNotionPage(threadTs, data, false);
+          notionPage = await findNotionPage(threadTs);
+          await say({ text: "📋 Project started in Notion — I'll keep updating it as you share more info.", thread_ts: threadTs });
+        } else {
+          await updateNotionPage(notionPage.id, data, false);
+          await say({ text: "📝 Notion updated with the new information!", thread_ts: threadTs });
+        }
       }
     }
+
+    // Handle full PROJECT SUMMARY — final update, mark as Ready for Design
+    if (reply.includes("---PROJECT SUMMARY---")) {
+      const data = parseBlock(reply, "---PROJECT SUMMARY---", "---END SUMMARY---");
+      if (data) {
+        if (!notionPage) {
+          await createNotionPage(threadTs, data, true);
+        } else {
+          await updateNotionPage(notionPage.id, data, true);
+        }
+        await say({ text: "✅ All done! Notion project is complete and marked *Ready for Design*.", thread_ts: threadTs });
+        notionPage = await findNotionPage(threadTs);
+      }
+    }
+
+    // Always persist the latest conversation history to Notion
+    if (notionPage) await saveConversation(notionPage.id, history);
+
   } catch (err) {
     console.error("Error:", err);
     await say({ text: "⚠️ Something went wrong. Please try again.", thread_ts: threadTs });
